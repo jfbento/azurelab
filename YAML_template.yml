@@ -1,0 +1,103 @@
+---
+#Parameters List
+# ApplicationScope:
+#   defaultValue: ''
+#   description: 'Comma-separated list of LifeTime applications to deploy.'
+# ApplicationScopeWithTests
+#   defaultValue: ''
+#   description: 'Comma-separated list of LifeTime applications to deploy (including test applications)'
+# TriggeredBy
+#    defaultValue: 'N/A'
+#    description: 'Name of LifeTime user that triggered the pipeline remotely.'
+
+steps:
+
+#Install required python dependencies for running pipeline activities.
+- powershell: mkdir $env:ArtifactsFolder -Force
+  displayName: 'Create ArtifactsFolder'
+
+- powershell: pip install -q -I virtualenv
+  displayName: Prepare Virual Environment
+
+- powershell: pip install -U outsystems-pipeline
+  displayName: Get OutSystems Pipeline Library
+
+#Fetch the latest versions (tags) in DEV for the configured Applications and deploy them to REG environment.
+- powershell: >
+    python -m outsystems.pipeline.fetch_lifetime_data 
+    --artifacts "$(ArtifactsFolder)"
+    --lt_url $env:lifeTimeEnvironmentURL
+    --lt_token $(LifeTimeServiceAccountToken)
+    --lt_api_version $(LifeTimeAPIVersion)
+  displayName: 'Fetch Lifetime Data'
+
+- powershell: >
+    python -m outsystems.pipeline.deploy_latest_tags_to_target_env 
+    --artifacts "$(ArtifactsFolder)"
+    --lt_url $(LifeTimeEnvironmentURL)
+    --lt_token $(LifeTimeServiceAccountToken) 
+    --lt_api_version $(LifeTimeAPIVersion)
+    --source_env $(DevelopmentEnvironment)
+    --destination_env $(RegressionEnvironment)
+    --app_list "$(ApplicationScopeWithTests)"
+  displayName: 'Deploy to REG Environment'
+
+#Generate python script for running BDD test scenarios using unittest module
+- powershell: >
+    python -m outsystems.pipeline.generate_unit_testing_assembly
+    --artifacts "$(ArtifactsFolder)"
+    --app_list "$(ApplicationScopeWithTests)"
+    --cicd_probe_env $(ProbeEnvironmentURL)
+    --bdd_framework_env $(BddEnvironmentURL)
+  displayName: 'Generate URLs for BDD testing'
+
+#Run unit test suite
+- powershell: >
+    python -m outsystems.pipeline.evaluate_test_results
+    --artifacts "$(ArtifactsFolder)"
+
+  errorActionPreference: continue
+  displayName: 'Evaluate Test Results'
+  continueOnError: false
+
+#Publish test results report
+- task: PublishTestResults@2
+  displayName: 'Publish Test Results'
+  inputs:
+    testResultsFiles: '$(ArtifactsFolder)\junit-result.xml'
+    mergeTestResults: true
+  condition: always()
+
+#Deploy the latest versions (tags) for the configured Applications (excluding test apps) from REG to ACC environment
+- powershell: >
+    python -m outsystems.pipeline.deploy_latest_tags_to_target_env 
+    --artifacts "$(ArtifactsFolder)"
+    --lt_url $(LifeTimeEnvironmentURL)
+    --lt_token $(LifeTimeServiceAccountToken) 
+    --lt_api_version $(LifeTimeAPIVersion)
+    --source_env $(RegressionEnvironment)
+    --destination_env $(AcceptanceEnvironment)
+    --app_list "$(ApplicationScope)"
+  displayName: 'Deploy to QA Environment'
+
+- powershell: >
+    New-Item -Path $(ArtifactsFolder) -Name "ApplicationScope.cache" -ItemType "file" -Value "$(ApplicationScope)"
+  errorActionPreference: continue
+  displayName: 'Write ApplicationScope to File'
+
+- powershell: 'Get-ChildItem "$(ArtifactsFolder)" -File -Recurse | ForEach-Object { $_.Name; Get-Content $_.FullName }'
+  errorActionPreference: continue
+  displayName: 'Get ArtifactsFolder Content to Log'
+  condition: always()
+
+- task: CopyFiles@2
+  displayName: 'Copy Files to Publish'
+  inputs:
+    SourceFolder: '$(ArtifactsFolder)'
+    TargetFolder: '$(build.artifactstagingdirectory)'
+
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish Artifact: versions'
+  inputs:
+    ArtifactName: versions
+...
